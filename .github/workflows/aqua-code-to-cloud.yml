@@ -9,7 +9,7 @@ on:
       - main
   workflow_dispatch:
     inputs:
-      report_only: 
+      report_only:
         description: >-
           Demo mode only: report Aqua and image findings without failing the
           security gates. Do not enable this for normal production releases.
@@ -62,6 +62,7 @@ jobs:
           args: >-
             trivy fs
             --scanners misconfig,vuln,secret
+            --secret-config ./trivy-secret.yaml
             --sast
             --reachability
             .
@@ -96,6 +97,7 @@ jobs:
           scan-type: fs
           scan-ref: .
           scanners: vuln,misconfig,secret
+          trivy-config: trivy.yaml
           format: sarif
           output: trivy-source-results.sarif
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
@@ -160,6 +162,7 @@ jobs:
           scan-type: image
           image-ref: ${{ env.IMAGE_REF }}
           scanners: vuln,misconfig,secret
+          trivy-config: trivy.yaml
           format: sarif
           output: trivy-image-results.sarif
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
@@ -174,6 +177,21 @@ jobs:
           sarif_file: trivy-image-results.sarif
           category: aqua-container-image
 
+      # Display the synthetic Dockerfile/.env findings separately so they are
+      # easy to see before the combined release gate evaluates all scanners.
+      - name: Demonstrate secrets embedded in the image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          scanners: secret
+          trivy-config: trivy.yaml
+          format: table
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: '0'
+          skip-setup-trivy: 'true'
+
+
       # This is the hard pre-registry gate. In normal runs, fixable HIGH or
       # CRITICAL vulnerabilities, severe image misconfigurations, or embedded
       # secrets block release. All findings remain visible in the SARIF report.
@@ -183,6 +201,7 @@ jobs:
           scan-type: image
           image-ref: ${{ env.IMAGE_REF }}
           scanners: vuln,misconfig,secret
+          trivy-config: trivy.yaml
           format: table
           severity: HIGH,CRITICAL
           ignore-unfixed: 'true'
