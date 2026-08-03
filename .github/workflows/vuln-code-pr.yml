@@ -40,12 +40,13 @@ jobs:
         uses: docker/build-push-action@v3
         with:
           push: true
-          tags: "stalibali/graphqlliveview:${{ github.sha }}"
+          #docker push talibaliaqua/dvga-talibali-cosign:tagname
+          tags: "talibaliaqua/dvga-talibali-cosign:${{ github.sha }}"
       - name: Cosign - Sign image with a key
         run: |
           cosign sign --key env://COSIGN_PRIVATE_KEY ${TAGS} -y
         env:
-          TAGS: stalibali/graphqlliveview:${{ github.sha }}
+          TAGS: talibaliaqua/dvga-talibali-cosign:${{ github.sha }}
           COSIGN_PRIVATE_KEY: ${{secrets.COSIGN_KEY}}
           COSIGN_PASSWORD: ${{secrets.COSIGN_PASSWORD}}
           
@@ -63,18 +64,18 @@ jobs:
               --access-token "${{ secrets.GITHUB_TOKEN }}" \
               --aqua-key "${{ secrets.AQUA_KEY }}" \
               --aqua-secret "${{ secrets.AQUA_SECRET }}" \
-              --artifact-path "stalibali/graphqlliveview:${{ github.sha }}" \
+              --artifact-path "talibaliaqua/dvga-talibali-cosign:${{ github.sha }}" \
               --report-format sbom \
               --sbom-path sbom.cdx.json
               
       - name: Attest SBOM
         run: cosign attest --key env://COSIGN_PRIVATE_KEY --type cyclonedx --predicate sbom.cdx.json ${TAGS} -y
         env:
-          TAGS: stalibali/graphqlliveview:${{ github.sha }}
+          TAGS: talibaliaqua/dvga-talibali-cosign:${{ github.sha }}
           COSIGN_PRIVATE_KEY: ${{secrets.COSIGN_KEY}}
           COSIGN_PASSWORD: ${{secrets.COSIGN_PASSWORD}}
           
       - name: Verify Docker SBOM Attestation
-        run: cosign verify-attestation --key env://COSIGN_PUB --type cyclonedx stalibali/graphqlliveview:${{ github.sha }}
+        run: cosign verify-attestation --key env://COSIGN_PUB --type cyclonedx talibaliaqua/dvga-talibali-cosign:${{ github.sha }}
         env:
           COSIGN_PUB: ${{secrets.COSIGN_PUB}}
