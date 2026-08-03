@@ -1,0 +1,8 @@
+# Shared Trivy settings used by the GitHub Actions workflow.
+# Scan both image filesystems and image configuration metadata such as ENV.
+image:
+  image-config-scanners:
+    - secret
+
+secret:
+  config: trivy-secret.yaml
