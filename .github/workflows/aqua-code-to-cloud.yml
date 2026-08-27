@@ -4,9 +4,11 @@ on:
   pull_request:
     branches:
       - main
+
   push:
     branches:
       - main
+
   workflow_dispatch:
     inputs:
       report_only:
@@ -16,18 +18,17 @@ on:
         required: true
         default: false
         type: boolean
+
       publish_image:
         description: Push, sign, and attest the image after all enabled gates
         required: true
         default: false
         type: boolean
 
-# Cancel an older run for the same branch or pull request.
 concurrency:
   group: aqua-code-to-cloud-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-# Least-privilege token permissions. security-events is used only for SARIF.
 permissions:
   contents: read
   actions: read
@@ -35,30 +36,50 @@ permissions:
 
 env:
   IMAGE_REPOSITORY: talibaliaqua/dvga-talibali-cosign
+
   COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
   IMAGE_REF: talibaliaqua/dvga-talibali-cosign:${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
   SHOULD_PUBLISH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_image) }}
 
 jobs:
+
+  # ============================================================
+  # JOB 1 - SOURCE / IaC / SAST / SECRETS / DEPENDENCIES
+  # ============================================================
+
   source-security:
+
     name: 1 - Source, IaC, SAST, secrets, and dependency gate
+
     runs-on: ubuntu-24.04
+
     timeout-minutes: 30
 
     steps:
-      - name: Check out the exact revision being evaluated
+
+      # --------------------------------------------------------
+      # Checkout exact revision
+      # --------------------------------------------------------
+
+      - name: Check out exact revision being evaluated
         uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.COMMIT_SHA }}
           fetch-depth: 0
           persist-credentials: false
 
-      # Aqua evaluates IaC misconfigurations, vulnerable dependencies, secrets,
-      # SAST findings, reachability, and the assurance policies configured in
-      # the Aqua tenant. A failed assurance policy returns a non-zero exit code.
+
+      # --------------------------------------------------------
+      # Aqua source + IaC security gate
+      # --------------------------------------------------------
+
       - name: Aqua source-code and IaC assurance gate
         uses: docker://aquasec/aqua-scanner
+
         with:
+
           args: >-
             trivy fs
             --scanners misconfig,vuln,secret
@@ -66,255 +87,594 @@ jobs:
             --sast
             --reachability
             .
+
         env:
+
           AQUA_KEY: ${{ secrets.AQUA_KEY }}
+
           AQUA_SECRET: ${{ secrets.AQUA_SECRET }}
+
           GITHUB_TOKEN: ${{ github.token }}
+
           TRIVY_RUN_AS_PLUGIN: aqua
+
           AQUA_ASSURANCE_EXPORT: aqua-assurance.json
+
+          # Normal runs = blocking
+          # Manual report_only = reporting only
           TRIVY_SKIP_POLICY_EXIT_CODE: ${{ github.event_name == 'workflow_dispatch' && inputs.report_only && 'true' || 'false' }}
+
           TRIVY_DEBUG: 'false'
 
-          # Explicit SCM metadata keeps Aqua results tied to the correct repo,
-          # commit, branch, workflow run, and pull request.
+          # --------------------------------------------------
+          # Explicit GitHub metadata
+          # --------------------------------------------------
+
           OVERRIDE_REPOSITORY: ${{ github.repository }}
+
           OVERRIDE_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+
           OVERRIDE_BRANCH: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+
           OVERRIDE_SOURCE_BRANCH: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+
           OVERRIDE_TARGET_BRANCH: ${{ github.event_name == 'pull_request' && github.base_ref || github.ref_name }}
+
           OVERRIDE_COMMIT: ${{ env.COMMIT_SHA }}
+
           OVERRIDE_PULL_REQUEST_ID: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+
           OVERRIDE_RUN_ID: ${{ github.run_id }}
+
           OVERRIDE_BUILD_ID: ${{ github.run_number }}
+
           OVERRIDE_BUILDSYSTEM: GitHub Actions
 
-      # This second, report-only scan creates SARIF for GitHub's Security tab.
-      # Aqua remains the authoritative source/policy gate above.
+
+      # --------------------------------------------------------
+      # Generate SARIF for GitHub Security
+      # --------------------------------------------------------
+
       - name: Generate source and IaC SARIF report
         if: ${{ always() }}
         uses: aquasecurity/trivy-action@v0.36.0
+
         with:
+
           scan-type: fs
+
           scan-ref: .
+
           scanners: vuln,misconfig,secret
+
           trivy-config: trivy.yaml
+
           format: sarif
+
           output: trivy-source-results.sarif
+
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+
           ignore-unfixed: 'false'
+
           exit-code: '0'
+
+
+      # --------------------------------------------------------
+      # Upload findings to GitHub Security
+      # --------------------------------------------------------
 
       - name: Publish source findings to GitHub Security
         if: ${{ always() && hashFiles('trivy-source-results.sarif') != '' }}
+
         continue-on-error: true
+
         uses: github/codeql-action/upload-sarif@v4.37.5
+
         with:
+
           sarif_file: trivy-source-results.sarif
+
           category: aqua-source-and-iac
+
+
+      # --------------------------------------------------------
+      # Preserve source reports
+      # --------------------------------------------------------
 
       - name: Preserve source scan reports
         if: ${{ always() }}
+
         uses: actions/upload-artifact@v7.0.1
+
         with:
+
           name: source-security-reports-${{ env.COMMIT_SHA }}
+
           path: |
             aqua-assurance.json
             trivy-source-results.sarif
+
           if-no-files-found: ignore
+
           retention-days: 30
 
+
+  # ============================================================
+  # JOB 2 - BUILD / IMAGE SECURITY / SIGN / SBOM
+  # ============================================================
+
   build-scan-publish:
+
     name: 2 - Build, image gate, publish, sign, and attest
+
     needs:
       - source-security
+
     runs-on: ubuntu-24.04
+
     timeout-minutes: 45
+
     steps:
-      - name: Check out the approved revision
+
+      # --------------------------------------------------------
+      # Checkout approved revision
+      # --------------------------------------------------------
+
+      - name: Check out approved revision
         uses: actions/checkout@v7.0.1
+
         with:
           ref: ${{ env.COMMIT_SHA }}
           fetch-depth: 0
           persist-credentials: false
 
+
+      # --------------------------------------------------------
+      # Docker Buildx
+      # --------------------------------------------------------
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4.2.0
 
-      # Build locally first. Nothing is pushed until the image gate passes.
+
+      # --------------------------------------------------------
+      # Build locally first
+      #
+      # IMPORTANT:
+      # Nothing is pushed until the image security gate passes.
+      # --------------------------------------------------------
+
       - name: Build image for security evaluation
         uses: docker/build-push-action@v7.3.0
+
         with:
+
           context: .
+
           file: ./Dockerfile
+
           load: true
+
           push: false
+
           pull: true
+
           tags: ${{ env.IMAGE_REF }}
+
           cache-from: type=gha
+
           cache-to: type=gha,mode=max
+
           provenance: false
+
           sbom: false
 
-      # Report-only pass for GitHub SARIF visibility.
+
+      # --------------------------------------------------------
+      # Generate complete image SARIF
+      # --------------------------------------------------------
+
       - name: Generate container-image SARIF report
+        if: ${{ always() }}
+
         uses: aquasecurity/trivy-action@v0.36.0
+
         with:
+
           scan-type: image
+
           image-ref: ${{ env.IMAGE_REF }}
+
           scanners: vuln,misconfig,secret
+
           trivy-config: trivy.yaml
+
           format: sarif
+
           output: trivy-image-results.sarif
+
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+
           ignore-unfixed: 'false'
+
           exit-code: '0'
+
+
+      # --------------------------------------------------------
+      # Upload image findings to GitHub Security
+      # --------------------------------------------------------
 
       - name: Publish image findings to GitHub Security
         if: ${{ always() && hashFiles('trivy-image-results.sarif') != '' }}
+
         continue-on-error: true
+
         uses: github/codeql-action/upload-sarif@v4.37.5
+
         with:
+
           sarif_file: trivy-image-results.sarif
+
           category: aqua-container-image
 
-      # Display the synthetic Dockerfile/.env findings separately so they are
-      # easy to see before the combined release gate evaluates all scanners.
-      - name: Demonstrate secrets embedded in the image
+
+      # --------------------------------------------------------
+      # Explicit secret demonstration
+      # --------------------------------------------------------
+
+      - name: Demonstrate secrets embedded in image
+
         uses: aquasecurity/trivy-action@v0.36.0
+
         with:
+
           scan-type: image
+
           image-ref: ${{ env.IMAGE_REF }}
+
           scanners: secret
+
           trivy-config: trivy.yaml
+
           format: table
+
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+
           exit-code: '0'
+
           skip-setup-trivy: 'true'
 
 
-      # This is the hard pre-registry gate. In normal runs, fixable HIGH or
-      # CRITICAL vulnerabilities, severe image misconfigurations, or embedded
-      # secrets block release. All findings remain visible in the SARIF report.
+      # --------------------------------------------------------
+      # HARD IMAGE SECURITY GATE
+      #
+      # Normal runs:
+      #   HIGH / CRITICAL fixable issues block release
+      #
+      # Manual report_only:
+      #   findings are reported but gate does not fail
+      # --------------------------------------------------------
+
       - name: Enforce container-image release gate
+
         uses: aquasecurity/trivy-action@v0.36.0
+
         with:
+
           scan-type: image
+
           image-ref: ${{ env.IMAGE_REF }}
+
           scanners: vuln,misconfig,secret
+
           trivy-config: trivy.yaml
+
           format: table
+
           severity: HIGH,CRITICAL
+
           ignore-unfixed: 'true'
+
           exit-code: ${{ github.event_name == 'workflow_dispatch' && inputs.report_only && '0' || '1' }}
+
           skip-setup-trivy: 'true'
+
+
+      # --------------------------------------------------------
+      # Preserve image report
+      # --------------------------------------------------------
 
       - name: Preserve image scan report
+
         if: ${{ always() }}
+
         uses: actions/upload-artifact@v7.0.1
+
         with:
+
           name: image-security-report-${{ env.COMMIT_SHA }}
+
           path: trivy-image-results.sarif
+
           if-no-files-found: ignore
+
           retention-days: 30
 
-      # Pull requests stop here. A main-branch push publishes automatically.
-      # A manual run publishes only when publish_image=true.
+
+      # ========================================================
+      # PUBLISH ONLY AFTER SECURITY GATES PASS
+      # ========================================================
+
       - name: Log in to Docker Hub
+
         if: ${{ env.SHOULD_PUBLISH == 'true' }}
+
         uses: docker/login-action@v4.6.0
+
         with:
+
           username: ${{ secrets.DOCKERHUB_USERNAME }}
+
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Push the policy-compliant image
+
+      - name: Push policy-compliant image
+
         if: ${{ env.SHOULD_PUBLISH == 'true' }}
+
         shell: bash
+
         run: |
+
           set -euo pipefail
+
+          echo "Pushing:"
+          echo "${IMAGE_REF}"
+
           docker push "${IMAGE_REF}"
 
-      # Resolve the immutable registry digest and use it for all signing and
-      # attestation operations so a mutable tag cannot be substituted later.
+
+      # ========================================================
+      # RESOLVE IMMUTABLE DIGEST
+      # ========================================================
+
       - name: Resolve immutable image digest
+
         if: ${{ env.SHOULD_PUBLISH == 'true' }}
+
         shell: bash
+
         run: |
+
           set -euo pipefail
 
           IMAGE_DIGEST=""
+
           for attempt in 1 2 3 4 5; do
+
             MANIFEST_JSON="$(
               docker buildx imagetools inspect "${IMAGE_REF}" \
                 --format '{{json .Manifest}}' 2>/dev/null || true
             )"
-            IMAGE_DIGEST="$(jq -r '.digest // empty' <<<"${MANIFEST_JSON}" 2>/dev/null || true)"
+
+            IMAGE_DIGEST="$(
+              jq -r '.digest // empty' <<<"${MANIFEST_JSON}" 2>/dev/null || true
+            )"
 
             if [[ -n "${IMAGE_DIGEST}" ]]; then
               break
             fi
 
             echo "Digest not visible yet; retrying (${attempt}/5)."
+
             sleep "$((attempt * 2))"
+
           done
 
           if [[ -z "${IMAGE_DIGEST}" ]]; then
-            echo "Unable to resolve the pushed image digest." >&2
+
+            echo "Unable to resolve pushed image digest." >&2
+
             exit 1
+
           fi
 
           SIGNED_IMAGE="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+
           echo "IMAGE_DIGEST=${IMAGE_DIGEST}" >> "${GITHUB_ENV}"
+
           echo "SIGNED_IMAGE=${SIGNED_IMAGE}" >> "${GITHUB_ENV}"
-          echo "Resolved immutable image: ${SIGNED_IMAGE}"
+
+          echo "Resolved immutable image:"
+          echo "${SIGNED_IMAGE}"
+
+
+      # ========================================================
+      # COSIGN
+      # ========================================================
 
       - name: Install Cosign
-        if: ${{ env.SHOULD_PUBLISH == 'true' }}
-        uses: sigstore/cosign-installer@v4.1.2
 
-      - name: Sign image digest with Cosign
         if: ${{ env.SHOULD_PUBLISH == 'true' }}
-        shell: bash
-        run: cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${SIGNED_IMAGE}"
-        env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
 
-      - name: Verify image signature
-        if: ${{ env.SHOULD_PUBLISH == 'true' }}
-        shell: bash
-        run: cosign verify --key env://COSIGN_PUB "${SIGNED_IMAGE}"
-        env:
-          COSIGN_PUB: ${{ secrets.COSIGN_PUB }}
+        uses: sigstore/cosign-installer@v4.1.1
 
-      - name: Install Billy and generate CycloneDX SBOM
+        with:
+
+          cosign-release: 'v3.0.6'
+
+
+      - name: Show Cosign version
+
         if: ${{ env.SHOULD_PUBLISH == 'true' }}
+
         shell: bash
-        env:
-          AQUA_KEY: ${{ secrets.AQUA_KEY }}
-          AQUA_SECRET: ${{ secrets.AQUA_SECRET }}
-          GH_TOKEN: ${{ github.token }}
+
         run: |
+
           set -euo pipefail
 
-          curl --fail --silent --show-error --location \
+          cosign version
+
+
+      # ========================================================
+      # SIGN IMAGE
+      #
+      # Key-based signing
+      # TLOG intentionally disabled for this demo so the
+      # workflow does not depend on Rekor/TUF connectivity.
+      #
+      # COSIGN_DOCKER_MEDIA_TYPES=1 is enabled for registry
+      # compatibility.
+      # ========================================================
+
+      - name: Sign immutable image digest
+
+        if: ${{ env.SHOULD_PUBLISH == 'true' }}
+
+        shell: bash
+
+        env:
+
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_KEY }}
+
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+
+          COSIGN_REPOSITORY: ${{ env.IMAGE_REPOSITORY }}
+
+          COSIGN_DOCKER_MEDIA_TYPES: '1'
+
+        run: |
+
+          set -euo pipefail
+
+          echo "Signing:"
+          echo "${SIGNED_IMAGE}"
+
+          cosign sign \
+            --yes \
+            --tlog-upload=false \
+            --key env://COSIGN_PRIVATE_KEY \
+            "${SIGNED_IMAGE}"
+
+
+      # ========================================================
+      # CONFIRM SIGNATURE ATTACHMENT
+      # ========================================================
+
+      - name: Confirm signature is attached to image
+
+        if: ${{ env.SHOULD_PUBLISH == 'true' }}
+
+        shell: bash
+
+        env:
+
+          COSIGN_REPOSITORY: ${{ env.IMAGE_REPOSITORY }}
+
+          COSIGN_DOCKER_MEDIA_TYPES: '1'
+
+        run: |
+
+          set -euo pipefail
+
+          echo "Cosign signature tree:"
+          cosign tree "${SIGNED_IMAGE}"
+
+
+      # ========================================================
+      # VERIFY SIGNATURE
+      #
+      # --offline means:
+      #   verify cryptographic signature locally
+      #   using COSIGN_PUB
+      #   without consulting Rekor/TUF
+      # ========================================================
+
+      - name: Verify image signature
+
+        if: ${{ env.SHOULD_PUBLISH == 'true' }}
+
+        shell: bash
+
+        env:
+
+          COSIGN_PUB: ${{ secrets.COSIGN_PUB }}
+
+          COSIGN_REPOSITORY: ${{ env.IMAGE_REPOSITORY }}
+
+          COSIGN_DOCKER_MEDIA_TYPES: '1'
+
+        run: |
+
+          set -euo pipefail
+
+          echo "Verifying:"
+          echo "${SIGNED_IMAGE}"
+
+          cosign verify \
+            --offline \
+            --key env://COSIGN_PUB \
+            "${SIGNED_IMAGE}"
+
+
+      # ========================================================
+      # SBOM
+      # ========================================================
+
+      - name: Install Billy and generate CycloneDX SBOM
+
+        if: ${{ env.SHOULD_PUBLISH == 'true' }}
+
+        shell: bash
+
+        env:
+
+          AQUA_KEY: ${{ secrets.AQUA_KEY }}
+
+          AQUA_SECRET: ${{ secrets.AQUA_SECRET }}
+
+          GH_TOKEN: ${{ github.token }}
+
+        run: |
+
+          set -euo pipefail
+
+          curl --fail \
+            --silent \
+            --show-error \
+            --location \
             https://download.codesec.aquasec.com/billy/install.sh \
             --output install.sh
-          curl --fail --silent --show-error --location \
+
+          curl --fail \
+            --silent \
+            --show-error \
+            --location \
             https://github.com/argonsecurity/releases/releases/latest/download/install.sh.checksum \
             --output install.sh.checksum
 
           EXPECTED_SHA="$(awk 'NF {print $1; exit}' install.sh.checksum)"
+
           ACTUAL_SHA="$(sha256sum install.sh | awk '{print $1}')"
 
           if [[ -z "${EXPECTED_SHA}" || "${EXPECTED_SHA}" != "${ACTUAL_SHA}" ]]; then
+
             echo "Billy installer checksum validation failed." >&2
+
             echo "Expected: ${EXPECTED_SHA:-missing}" >&2
+
             echo "Actual:   ${ACTUAL_SHA}" >&2
+
             exit 1
+
           fi
 
           chmod +x install.sh
+
           ./install.sh
+
           rm -f install.sh install.sh.checksum
 
           billy generate \
@@ -327,50 +687,111 @@ jobs:
 
           test -s sbom.cdx.json
 
-      - name: Attest SBOM to the immutable image digest
+
+      # ========================================================
+      # SBOM ATTESTATION
+      # ========================================================
+
+      - name: Attest CycloneDX SBOM to image digest
+
         if: ${{ env.SHOULD_PUBLISH == 'true' }}
+
         shell: bash
-        run: >-
-          cosign attest --yes
-          --key env://COSIGN_PRIVATE_KEY
-          --type cyclonedx
-          --predicate sbom.cdx.json
-          "${SIGNED_IMAGE}"
+
         env:
+
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_KEY }}
+
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
 
+          COSIGN_REPOSITORY: ${{ env.IMAGE_REPOSITORY }}
+
+          COSIGN_DOCKER_MEDIA_TYPES: '1'
+
+        run: |
+
+          set -euo pipefail
+
+          cosign attest \
+            --yes \
+            --tlog-upload=false \
+            --key env://COSIGN_PRIVATE_KEY \
+            --type cyclonedx \
+            --predicate sbom.cdx.json \
+            "${SIGNED_IMAGE}"
+
+
+      # ========================================================
+      # VERIFY SBOM ATTESTATION
+      # ========================================================
+
       - name: Verify CycloneDX SBOM attestation
+
         if: ${{ env.SHOULD_PUBLISH == 'true' }}
+
         shell: bash
-        run: >-
-          cosign verify-attestation
-          --key env://COSIGN_PUB
-          --type cyclonedx
-          "${SIGNED_IMAGE}"
+
         env:
+
           COSIGN_PUB: ${{ secrets.COSIGN_PUB }}
 
+          COSIGN_REPOSITORY: ${{ env.IMAGE_REPOSITORY }}
+
+          COSIGN_DOCKER_MEDIA_TYPES: '1'
+
+        run: |
+
+          set -euo pipefail
+
+          cosign verify-attestation \
+            --offline \
+            --key env://COSIGN_PUB \
+            --type cyclonedx \
+            "${SIGNED_IMAGE}"
+
+
+      # ========================================================
+      # PRESERVE SBOM
+      # ========================================================
+
       - name: Preserve generated SBOM
+
         if: ${{ env.SHOULD_PUBLISH == 'true' && always() }}
+
         uses: actions/upload-artifact@v7.0.1
+
         with:
+
           name: cyclonedx-sbom-${{ env.COMMIT_SHA }}
+
           path: sbom.cdx.json
+
           if-no-files-found: ignore
+
           retention-days: 90
 
+
+      # ========================================================
+      # FINAL SUMMARY
+      # ========================================================
+
       - name: Write release summary
+
         if: ${{ env.SHOULD_PUBLISH == 'true' && success() }}
+
         shell: bash
+
         run: |
+
           {
-            echo "## Aqua code-to-cloud release"
+            echo "## Aqua Code-to-Cloud Release"
             echo
             echo "- Image tag: \`${IMAGE_REF}\`"
-            echo "- Signed digest: \`${SIGNED_IMAGE}\`"
-            echo "- Source/IaC assurance gate: passed or explicitly report-only"
-            echo "- Pre-registry image gate: passed or explicitly report-only"
+            echo "- Immutable digest: \`${SIGNED_IMAGE}\`"
+            echo "- Source/IaC security gate: passed or explicitly report-only"
+            echo "- Container-image security gate: passed or explicitly report-only"
+            echo "- Image published: yes"
             echo "- Cosign signature: verified"
+            echo "- CycloneDX SBOM: generated"
             echo "- CycloneDX SBOM attestation: verified"
           } >> "${GITHUB_STEP_SUMMARY}"
