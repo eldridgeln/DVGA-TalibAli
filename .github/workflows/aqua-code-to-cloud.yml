@@ -16,7 +16,7 @@ on:
         description: >-
           Demo mode only: report Aqua and image findings without blocking
           the release. Do not use this for normal production releases.
-        required: true
+        required: false
         default: false
         type: boolean
 
