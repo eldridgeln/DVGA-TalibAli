@@ -1,0 +1,115 @@
+# Existing Aqua SaaS source integration, in non-blocking pilot mode.
+      - name: Aqua SaaS source scan
+        uses: docker://aquasec/aqua-scanner
+        with:
+          args: >-
+            trivy fs --scanners misconfig,vuln,secret
+            --secret-config ./trivy-secret.yaml --sast --reachability .
+        env:
+          AQUA_KEY: ${{ secrets.AQUA_KEY }}
+          AQUA_SECRET: ${{ secrets.AQUA_SECRET }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TRIVY_RUN_AS_PLUGIN: aqua
+          TRIVY_SKIP_POLICY_EXIT_CODE: 'true'
+          AQUA_ASSURANCE_EXPORT: aqua-assurance.json
+
+      - name: Build image with test labels
+        shell: bash
+        env:
+          LABEL_MODE: ${{ inputs.label_mode }}
+        run: |
+          set -euo pipefail
+          labels=()
+          case "$LABEL_MODE" in
+            present) labels=(--label team=payments --label environment=dev --label application=label-poc) ;;
+            wrong)   labels=(--label team=other --label environment=prod --label application=label-poc) ;;
+            missing) ;;
+          esac
+          docker build --pull "${labels[@]}" -t "$IMAGE_REF" .
+
+      - name: Check image labels
+        shell: bash
+        env:
+          LABEL_MODE: ${{ inputs.label_mode }}
+        run: |
+          set -euo pipefail
+          docker image inspect "$IMAGE_REF" --format '{{json .Config.Labels}}' > image-labels.json
+          team="$(jq -r '.team // ""' image-labels.json)"
+          environment="$(jq -r '.environment // ""' image-labels.json)"
+          application="$(jq -r '.application // ""' image-labels.json)"
+
+          case "$LABEL_MODE" in
+            present) expected="payments dev label-poc" ;;
+            wrong)   expected="other prod label-poc" ;;
+            missing) expected="  " ;;
+          esac
+          observed="$team $environment $application"
+          if [[ "$observed" != "$expected" ]]; then
+            echo "Unexpected labels; check whether the Dockerfile already defines them." >&2
+            cat image-labels.json
+            exit 1
+          fi
+          echo "Label test passed ($LABEL_MODE)"
+          cat image-labels.json
+          echo "SCAN_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      # Trivy proves pipeline scanning, not Aqua-managed label propagation.
+      - name: Scan image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          scanners: vuln,misconfig,secret
+          format: json
+          output: image-scan.json
+          exit-code: '0'
+
+      - name: Summarize pilot
+        shell: bash
+        env:
+          LABEL_MODE: ${{ inputs.label_mode }}
+        run: |
+          seconds=$(( $(date +%s) - SCAN_START ))
+          {
+            echo "## Aqua labeling pilot"
+            echo "- Label mode: $LABEL_MODE"
+            echo "- OCI image labels: verified"
+            echo "- Trivy scan time: ${seconds}s"
+            echo "- Aqua-managed image labels: check separately in Aqua"
+            echo "- Image registration/CI-CD history: check separately in Aqua"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save evidence
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: aqua-label-pilot-${{ inputs.label_mode }}-${{ github.run_id }}
+          path: |
+            image-labels.json
+            image-scan.json
+            aqua-assurance.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Login to Docker Hub (optional)
+        if: ${{ inputs.publish_image }}
+        uses: docker/login-action@v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish test image (optional)
+        if: ${{ inputs.publish_image }}
+        shell: bash
+        env:
+          PILOT_REPO: ${{ vars.AQUA_PILOT_IMAGE_REPOSITORY }}
+          LABEL_MODE: ${{ inputs.label_mode }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$PILOT_REPO" || "$PILOT_REPO" == "talibaliaqua/dvga-talibali-cosign" ]]; then
+            echo "Set AQUA_PILOT_IMAGE_REPOSITORY to a separate Docker Hub test repository." >&2
+            exit 1
+          fi
+          remote="$PILOT_REPO:aqua-poc-$LABEL_MODE-$GITHUB_RUN_ID"
+          docker tag "$IMAGE_REF" "$remote"
+          docker push "$remote"
+          echo "- Test registry image: \`$remote\`" >> "$GITHUB_STEP_SUMMARY"
