@@ -1,4 +1,37 @@
-# Existing Aqua SaaS source integration, in non-blocking pilot mode.
+name: Aqua Label Pilot (manual only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      label_mode:
+        description: Labels to apply to test image
+        required: true
+        type: choice
+        default: present
+        options:
+          - present
+          - missing
+          - wrong
+      publish_image:
+        description: Push to a separate Docker Hub test repository
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REF: aqua-label-pilot:${{ github.run_id }}
+
+jobs:
+  pilot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      # Existing Aqua SaaS source integration, in non-blocking pilot mode.
       - name: Aqua SaaS source scan
         uses: docker://aquasec/aqua-scanner
         with:
